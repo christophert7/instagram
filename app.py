@@ -37,6 +37,7 @@ MODE_LABELS = {
     "following": "الحسابات التي يتابعها المستخدم (Following)",
     "followers": "متابعو المستخدم (Followers)",
     "reel": "المتفاعلون مع ريل أو منشور",
+    "search": "بحث Reels أو هاشتاغ",
 }
 AUDIENCE_LABELS = {
     "commenters": "المعلّقون",
@@ -50,6 +51,20 @@ SOURCE_LABELS = {  # قيمة عمود Source في نتائج الريل
 }
 EST_PAGE_SIZE = 50          # صفحة المتابعين ترجع 25–100 حساب؛ 50 للتقدير فقط
 COMMENTS_PER_PAGE = 15      # حسب توثيق HikerAPI: كل طلب تعليقات يرجع 15 تعليقاً
+SEARCH_LABELS = {
+    "reels": "Reels بكلمة بحث (مثل: i want sleep)",
+    "tag_top": "هاشتاغ: المنشورات الأبرز",
+    "tag_recent": "هاشتاغ: المنشورات الأحدث",
+    "tag_reels": "هاشتاغ: الريلز فقط",
+}
+SEARCH_ENDPOINTS = {  # (المسار، اسم باراميتر الكلمة) — من توثيق HikerAPI الرسمي
+    "reels": ("/v2/fbsearch/reels", "query"),
+    "tag_top": ("/v2/hashtag/medias/top", "name"),
+    "tag_recent": ("/v2/hashtag/medias/recent", "name"),
+    "tag_reels": ("/v1/hashtag/medias/clips/chunk", "name"),
+}
+SEARCH_SHORT = {"tag_top": "top", "tag_recent": "recent", "tag_reels": "reels"}
+EST_AUTHORS_PER_PAGE = 10   # تقدير متحفظ لعدد الحسابات الجديدة في كل صفحة بحث
 FATAL_STATUSES = {401, 402}  # مفتاح خاطئ أو رصيد منتهٍ: نوقف العمل فوراً
 
 COLUMNS = [
@@ -57,10 +72,18 @@ COLUMNS = [
     "Business", "Verified", "Private", "Followers", "Following", "Posts",
     "Website", "Bio", "Profile URL",
 ]
-EXTRA_COLUMNS = ["Source", "Comment"]  # تظهر فقط في نتائج الريل
+EXTRA_COLUMNS = ["Source", "Comment", "Views", "Post URL", "Email from"]  # تظهر حسب المصدر
 NUMERIC_COLUMNS = ["Followers", "Following", "Posts"]
 
 SHORTCODE_RE = re.compile(r"instagram\.com/(?:(?!share/)[A-Za-z0-9._]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)")
+FREE_MAIL_DOMAINS = {  # إيميل على مزوّد مجاني = شخصي غالباً، وعلى نطاق خاص = تجاري غالباً
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.fr", "yahoo.co.uk", "ymail.com",
+    "hotmail.com", "hotmail.fr", "hotmail.co.uk", "outlook.com", "outlook.fr", "live.com",
+    "live.fr", "msn.com", "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com",
+    "aol.com", "gmx.com", "gmx.de", "mail.ru", "yandex.com", "yandex.ru", "zoho.com", "mail.com",
+}
+SKIP_LABELS = {"private": "خاصاً", "verified": "موثّقاً", "business": "تجارياً"}
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 OBFUSCATIONS = [  # name [at] gmail [dot] com  →  name@gmail.com
     (re.compile(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", re.I), "@"),
@@ -166,6 +189,22 @@ def _unwrap(data) -> dict:
     return data["user"] if isinstance(data.get("user"), dict) else data
 
 
+def skip_reason(user: dict, skip_private=True, skip_verified=False, skip_business=False) -> str | None:
+    """أسباب التخطي المجانية: ما يمكن معرفته من بيانات القائمة قبل دفع أي طلب."""
+    if skip_private and user.get("is_private"):
+        return "private"
+    if skip_verified and user.get("is_verified"):
+        return "verified"
+    if skip_business and (user.get("is_business") or user.get("is_business_account")
+                          or user.get("account_type") == 2):
+        return "business"
+    return None
+
+
+def is_personal_email(email) -> bool:
+    return str(email or "").split("@")[-1].strip().lower() in FREE_MAIL_DOMAINS
+
+
 def parse_page(data, key: str = "users") -> tuple[list, str | None]:
     """يدعم أشكال الرد: [items, cursor] أو {"response": {key: [...]}, "next_page_id": ...}
     أو {key: [...], "next_max_id": ...} أو قائمة عناصر بلا صفحات."""
@@ -190,9 +229,10 @@ def lookup_user(client: HikerClient, username: str) -> dict:
     return user
 
 
-def collect_accounts(client, user_id, mode, limit, skip_private=True, on_progress=None):
-    """يجمع حتى `limit` حساباً من القائمة. الحسابات الخاصة تُعدّ فقط ولا يُدفع على تفاصيلها."""
-    accounts, seen, skipped = [], set(), 0
+def collect_accounts(client, user_id, mode, limit, skip_private=True, on_progress=None,
+                     skip_verified=False, skip_business=False):
+    """يجمع حتى `limit` حساباً من القائمة. المتخطّى يُعدّ فقط ولا يُدفع على تفاصيله."""
+    accounts, seen, skips = [], set(), {}
     cursor, pages, max_pages = None, 0, 50 + limit // 10
     while len(accounts) < limit and pages < max_pages:
         page, next_cursor = parse_page(client.get(LIST_ENDPOINTS[mode], user_id=user_id, max_id=cursor))
@@ -204,8 +244,9 @@ def collect_accounts(client, user_id, mode, limit, skip_private=True, on_progres
                 continue
             seen.add(pk)
             added += 1
-            if skip_private and user.get("is_private"):
-                skipped += 1
+            reason = skip_reason(user, skip_private, skip_verified, skip_business)
+            if reason:
+                skips[reason] = skips.get(reason, 0) + 1
                 continue
             accounts.append(user)
             if len(accounts) >= limit:
@@ -215,7 +256,7 @@ def collect_accounts(client, user_id, mode, limit, skip_private=True, on_progres
         if not next_cursor or next_cursor == cursor or added == 0:
             break
         cursor = next_cursor
-    return accounts, skipped
+    return accounts, skips
 
 
 # ─── المصدر 2: المتفاعلون مع ريل أو منشور ────────────────────────────────────
@@ -259,20 +300,22 @@ def resolve_media(client: HikerClient, text: str) -> dict:
     return media
 
 
-def collect_audience(client, media: dict, audience: str, limit: int, skip_private=True, on_progress=None):
+def collect_audience(client, media: dict, audience: str, limit: int, skip_private=True, on_progress=None,
+                     skip_verified=False, skip_business=False):
     """يجمع المعلّقين و/أو المعجبين بدون تكرار وبدون صاحب الريل.
     الأولوية: من علّق وأعجب معاً، ثم المعلّقون، ثم المعجبون."""
     media_id = str(media.get("id") or _pk(media))
     owner_pk = _pk(media.get("user") or media.get("owner") or {})
     people: dict[str, dict] = {}
-    skipped: set[str] = set()
+    skipped: dict[str, set] = {}
 
     def add(user: dict, source: str, comment: str = "") -> None:
         pk = _pk(user or {})
         if not pk or pk == owner_pk:
             return
-        if skip_private and user.get("is_private"):
-            skipped.add(pk)
+        reason = skip_reason(user, skip_private, skip_verified, skip_business)
+        if reason:
+            skipped.setdefault(reason, set()).add(pk)
             return
         person = people.get(pk)
         if person is None:
@@ -312,7 +355,124 @@ def collect_audience(client, media: dict, audience: str, limit: int, skip_privat
         _pk(p["user"]): {"Source": SOURCE_LABELS[frozenset(p["sources"])], "Comment": p["comment"]}
         for p in chosen
     }
-    return [p["user"] for p in chosen], meta, len(skipped)
+    return [p["user"] for p in chosen], meta, {k: len(v) for k, v in skipped.items()}
+
+
+# ─── المصدر 3: بحث Reels أو هاشتاغ ───────────────────────────────────────────
+def clean_search_term(kind: str, text: str) -> str:
+    text = (text or "").strip()
+    if kind == "reels":
+        return text
+    return re.sub(r"[\s#]+", "", text).lower()  # الهاشتاغ بدون # وبدون مسافات
+
+
+def iter_media(obj, found: list | None = None) -> list[dict]:
+    """يلتقط كل المنشورات من أي شكل للرد (sections / clips / modules / قوائم)."""
+    if found is None:
+        found = []
+    if isinstance(obj, dict):
+        author = obj.get("user") or obj.get("owner")
+        if isinstance(author, dict) and (obj.get("code") or obj.get("media_type") is not None):
+            found.append(obj)
+            return found
+        for value in obj.values():
+            iter_media(value, found)
+    elif isinstance(obj, list):
+        for value in obj:
+            iter_media(value, found)
+    return found
+
+
+def search_cursor(data, kind: str) -> dict | None:
+    """باراميترات الصفحة التالية حسب نوع البحث، أو None إن انتهت النتائج."""
+    if isinstance(data, list):  # v1: [items, next_max_id]
+        nxt = data[1] if len(data) == 2 and isinstance(data[1], str) else None
+        return {"max_id": nxt} if nxt else None
+    if not isinstance(data, dict):
+        return None
+    body = data["response"] if isinstance(data.get("response"), dict) else data
+    if kind == "reels":
+        max_id = body.get("reels_max_id") or data.get("reels_max_id") or data.get("next_page_id")
+        if not max_id or body.get("has_more") is False or data.get("has_more") is False:
+            return None
+        cursor = {"reels_max_id": max_id}
+        rank = body.get("rank_token") or data.get("rank_token")
+        if rank:
+            cursor["rank_token"] = rank
+        return cursor
+    nxt = data.get("next_page_id") or body.get("next_max_id")
+    if not nxt:
+        return None
+    return {"max_id": nxt} if kind == "tag_reels" else {"page_id": nxt}
+
+
+def media_views(media: dict) -> int:
+    """المشاهدات للريلز والفيديو، والإعجابات للصور."""
+    for key in ("play_count", "ig_play_count", "view_count", "video_view_count"):
+        value = media.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    likes = media.get("like_count")
+    return int(likes) if isinstance(likes, (int, float)) else 0
+
+
+def media_caption(media: dict) -> str:
+    caption = media.get("caption_text")
+    if not caption and isinstance(media.get("caption"), dict):
+        caption = media["caption"].get("text")
+    return caption or ""
+
+
+def media_url(media: dict) -> str:
+    return f"https://www.instagram.com/p/{media['code']}/" if media.get("code") else ""
+
+
+def collect_search_authors(client, kind, term, limit, min_views=0, skip_private=True, on_progress=None,
+                           skip_verified=False, skip_business=False):
+    """أصحاب المنشورات بدون تكرار، مع أعلى مشاهدات لكل واحد، والإيميلات المكتوبة في نص منشوراتهم."""
+    path, param = SEARCH_ENDPOINTS[kind]
+    authors: dict[str, dict] = {}
+    skipped, below, seen_media = {}, set(), set()
+    cursor: dict = {}
+    pages, max_pages = 0, 20 + limit // 2
+    while pages < max_pages:
+        data = client.get(path, **{param: term}, **cursor)
+        pages += 1
+        medias = [m for m in iter_media(data) if _pk(m) not in seen_media]
+        seen_media.update(_pk(m) for m in medias)
+        for media in medias:
+            user = media.get("user") or media.get("owner") or {}
+            pk = _pk(user)
+            if not pk:
+                continue
+            reason = skip_reason(user, skip_private, skip_verified, skip_business)
+            if reason:
+                skipped.setdefault(reason, set()).add(pk)
+                continue
+            views = media_views(media)
+            author = authors.get(pk)
+            if author is None:
+                if views < min_views:
+                    below.add(pk)
+                    continue
+                if len(authors) >= limit:
+                    continue
+                author = authors[pk] = {"user": user, "views": views, "url": media_url(media), "emails": []}
+            if views > author["views"]:
+                author["views"], author["url"] = views, media_url(media)
+            for email in extract_emails(media_caption(media)):
+                if email not in author["emails"]:
+                    author["emails"].append(email)
+        if on_progress:
+            on_progress(len(authors))
+        next_cursor = search_cursor(data, kind)
+        if len(authors) >= limit or not medias or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    found = set(authors)
+    stats = {"skips": {k: len(v - found) for k, v in skipped.items() if v - found},
+             "below": len(below - found), "pages": pages}
+    return list(authors.values()), stats
 
 
 # ─── تفاصيل البروفايل ────────────────────────────────────────────────────────
@@ -376,6 +536,8 @@ def fetch_profile(client: HikerClient, pk: str) -> dict:
 
 
 def estimate_requests(limit: int, mode: str = "following", audience: str = "commenters") -> int:
+    if mode == "search":  # صفحات البحث + بروفايل لكل حساب (أقل فعلياً بفضل إيميلات النص)
+        return math.ceil(limit / EST_AUTHORS_PER_PAGE) + limit
     if mode != "reel":
         return 1 + math.ceil(limit / EST_PAGE_SIZE) + limit
     total = 1 + limit  # فتح الريل + بروفايل لكل شخص
@@ -390,7 +552,7 @@ def make_df(indexed_rows: list[tuple[int, dict]]) -> pd.DataFrame:
     ordered = [row for _, row in sorted(indexed_rows, key=lambda item: item[0])]
     extra = [col for col in EXTRA_COLUMNS if any(col in row for row in ordered)]
     df = pd.DataFrame(ordered, columns=COLUMNS + extra)
-    for col in NUMERIC_COLUMNS:
+    for col in NUMERIC_COLUMNS + (["Views"] if "Views" in df.columns else []):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
     return df
 
@@ -457,11 +619,60 @@ def require_password() -> None:
     st.stop()
 
 
-def run_job(client, target_text, mode, audience, limit, skip_private, workers):
+def finish_row(row: dict, extra: dict | None) -> dict:
+    """يضيف بيانات المصدر للصف. في البحث: إن لم يكن في البروفايل إيميل نستعمل إيميل نص المنشور."""
+    if not extra:
+        return row
+    extra = dict(extra)
+    caption_emails = extra.pop("_caption_emails", None)
+    row.update(extra)
+    if caption_emails is not None:
+        found = [row["Email"]] if row["Email"] else []
+        found += [e.strip() for e in row["Other emails"].split(",") if e.strip()]
+        from_profile = bool(found)
+        for email in caption_emails:
+            if email not in found:
+                found.append(email)
+        row["Email"] = found[0] if found else ""
+        row["Other emails"] = ", ".join(found[1:])
+        row["Email from"] = "profile" if from_profile else ("caption" if found else "")
+    return row
+
+
+def fetch_profiles(client, jobs, meta, workers, rows, progress, preview):
+    """يفحص البروفايلات بالتوازي. jobs: [(الترتيب، المستخدم)]. يرجع (الأخطاء، سبب التوقف)."""
+    errors, aborted, total = [], None, len(jobs)
+    if not total:
+        return errors, aborted
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_profile, client, _pk(user)): (index, user) for index, user in jobs}
+        for done, future in enumerate(as_completed(futures), start=1):
+            index, user = futures[future]
+            name = f"@{user.get('username', _pk(user))}"
+            try:
+                rows.append((index, finish_row(future.result(), meta.get(_pk(user)))))
+            except ApiError as exc:
+                errors.append(f"{name}: {exc}")
+                if exc.status in FATAL_STATUSES:
+                    aborted = friendly_error(exc, str(exc))
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+            except Exception as exc:  # بيانات غير متوقعة لحساب واحد لا توقف العمل كله
+                errors.append(f"{name}: {exc}")
+            progress.progress(0.2 + 0.8 * done / total, text=f"فحص البروفايلات… {done}/{total}")
+            if done % 10 == 0 or done == total:
+                preview.dataframe(make_df(rows), hide_index=True)
+    return errors, aborted
+
+
+def run_job(client, target_text, mode, limit, skip_private, workers, audience="commenters",
+            search_kind="reels", min_views=0, caption_only=True, personal_only=False):
     st.session_state.pop("job", None)
     progress = st.progress(0.0, text="جاري التحضير…")
     preview = st.empty()
     meta: dict = {}
+    rows: list = []
+    notes: list[str] = []
 
     def fail(message: str) -> None:
         progress.empty()
@@ -479,9 +690,47 @@ def run_job(client, target_text, mode, audience, limit, skip_private, workers):
         owner = (media.get("user") or {}).get("username") or ""
         label, slug = f"ريل {code}" + (f" (@{owner})" if owner else ""), f"reel_{code}"
         try:
-            accounts, meta, skipped = collect_audience(client, media, audience, limit, skip_private, report)
+            accounts, meta, skips = collect_audience(client, media, audience, limit, skip_private, report,
+                                                     skip_verified=personal_only, skip_business=personal_only)
         except ApiError as exc:
             return fail(friendly_error(exc, "فشل جلب المتفاعلين."))
+        skipped = sum(skips.values())
+        jobs, listed = list(enumerate(accounts)), len(accounts) + skipped
+
+    elif mode == "search":
+        term = clean_search_term(search_kind, target_text)
+        try:
+            authors, stats = collect_search_authors(client, search_kind, term, limit, min_views,
+                                                    skip_private, report,
+                                                    skip_verified=personal_only, skip_business=personal_only)
+        except ApiError as exc:
+            return fail(friendly_error(exc, "فشل البحث."))
+        if not authors:
+            hint = "، أو خفّض حد المشاهدات" if min_views else ""
+            return fail(f"لم أجد منشورات مناسبة. جرّب كلمة أو هاشتاغاً آخر{hint}.")
+        source = f"reels: {term}" if search_kind == "reels" else f"#{term} ({SEARCH_SHORT[search_kind]})"
+        label = f"بحث «{term}»" if search_kind == "reels" else f"#{term}"
+        slug = "search_" + (re.sub(r"[^A-Za-z0-9_-]+", "_", term).strip("_")[:40] or "results")
+        jobs, free = [], 0
+        for index, author in enumerate(authors):
+            extra = {"Source": source, "Views": author["views"], "Post URL": author["url"]}
+            if author["emails"] and caption_only:
+                row = normalize_profile(author["user"])  # بيانات مختصرة + إيميل النص، دون أي طلب
+                row.update(extra)
+                row["Email"], row["Other emails"] = author["emails"][0], ", ".join(author["emails"][1:])
+                row["Email from"] = "caption"
+                rows.append((index, row))
+                free += 1
+            else:
+                jobs.append((index, author["user"]))
+                meta[_pk(author["user"])] = {**extra, "_caption_emails": author["emails"]}
+        skips = stats["skips"]
+        skipped, listed = sum(skips.values()), len(authors) + sum(skips.values())
+        if stats["below"]:
+            notes.append(f"تم تجاهل {stats['below']} حساباً لم تبلغ منشوراته {min_views:,} مشاهدة، دون تكلفة.")
+        if free:
+            notes.append(f"{free} إيميلاً وُجدت في نص المنشورات مباشرة، دون فحص البروفايل (مجاناً).")
+
     else:
         username = clean_username(target_text)
         try:
@@ -491,32 +740,18 @@ def run_job(client, target_text, mode, audience, limit, skip_private, workers):
         if target.get("is_private"):
             return fail(f"@{username} حساب خاص، ولا يمكن جلب قائمته. جرّب حساباً عاماً.")
         try:
-            accounts, skipped = collect_accounts(client, _pk(target), mode, limit, skip_private, report)
+            accounts, skips = collect_accounts(client, _pk(target), mode, limit, skip_private, report,
+                                               skip_verified=personal_only, skip_business=personal_only)
         except ApiError as exc:
             return fail(friendly_error(exc, "فشل جلب القائمة."))
+        skipped = sum(skips.values())
         label, slug = f"@{username}", f"{mode}_{username}"
+        jobs, listed = list(enumerate(accounts)), len(accounts) + skipped
 
-    rows, errors, aborted = [], [], None
-    if accounts:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fetch_profile, client, _pk(a)): (i, a) for i, a in enumerate(accounts)}
-            for done, future in enumerate(as_completed(futures), start=1):
-                index, account = futures[future]
-                try:
-                    row = future.result()
-                    row.update(meta.get(_pk(account), {}))
-                    rows.append((index, row))
-                except ApiError as exc:
-                    errors.append(f"@{account.get('username', _pk(account))}: {exc}")
-                    if exc.status in FATAL_STATUSES:
-                        aborted = friendly_error(exc, str(exc))
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        break
-                except Exception as exc:  # بيانات غير متوقعة لحساب واحد لا توقف العمل كله
-                    errors.append(f"@{account.get('username', _pk(account))}: {exc}")
-                progress.progress(0.2 + 0.8 * done / len(accounts), text=f"فحص البروفايلات… {done}/{len(accounts)}")
-                if done % 10 == 0 or done == len(accounts):
-                    preview.dataframe(make_df(rows), hide_index=True)
+    if skipped:
+        detail = " و".join(f"{count} {SKIP_LABELS.get(reason, reason)}" for reason, count in skips.items())
+        notes.insert(0, f"تم تخطي {detail} دون أي تكلفة.")
+    errors, aborted = fetch_profiles(client, jobs, meta, workers, rows, progress, preview)
 
     progress.empty()
     preview.empty()
@@ -524,8 +759,11 @@ def run_job(client, target_text, mode, audience, limit, skip_private, workers):
         "df": make_df(rows),
         "label": label,
         "slug": slug,
-        "listed": len(accounts) + skipped,
+        "listed": listed,
         "skipped": skipped,
+        "skips": skips,
+        "personal_only": personal_only,
+        "notes": notes,
         "errors": errors,
         "aborted": aborted,
         "requests": client.requests_used,
@@ -546,20 +784,34 @@ def show_results(price: float) -> None:
     with_email = has_value(df["Email"])
     cols = st.columns(5)
     cols[0].metric("في القائمة", job["listed"])
-    cols[1].metric("تم فحصها", len(df))
+    cols[1].metric("في النتائج", len(df))
     cols[2].metric("لديها إيميل", int(with_email.sum()))
     cols[3].metric("لديها هاتف", int(has_value(df["Phone"]).sum()))
     cols[4].metric("التكلفة التقريبية", f"{job['requests'] * price:.2f}$", help=f"{job['requests']} طلب")
-    if job["skipped"]:
-        st.caption(f"تم تخطي {job['skipped']} حساباً خاصاً دون أي تكلفة.")
+    for note in job.get("notes", []):
+        st.caption(note)
 
-    only_email = st.checkbox("اعرض فقط من لديهم إيميل", key="only_email")
-    view = df[with_email] if only_email else df
+    f1, f2, f3 = st.columns(3)
+    only_email = f1.checkbox("فقط من لديهم إيميل", key="only_email")
+    no_business = f2.checkbox("استبعد الحسابات التجارية", value=job.get("personal_only", False),
+                              key="no_business")
+    personal_mail = f3.checkbox("إيميلات شخصية فقط (gmail وأمثاله)", key="personal_mail")
+    keep = pd.Series(True, index=df.index)
+    if only_email or personal_mail:
+        keep &= with_email
+    if no_business:
+        keep &= ~df["Business"].fillna(False).astype(bool)
+    if personal_mail:
+        keep &= df["Email"].map(is_personal_email)
+    view = df[keep]
+    if len(view) != len(df):
+        st.caption(f"المعروض والمصدَّر: {len(view)} من {len(df)}.")
     st.dataframe(
         view, hide_index=True,
         column_config={
             "Profile URL": st.column_config.LinkColumn("Profile URL"),
             "Website": st.column_config.LinkColumn("Website"),
+            "Post URL": st.column_config.LinkColumn("Post URL"),
         },
     )
 
@@ -600,7 +852,7 @@ def main() -> None:
     st.caption("استخراج البيانات العامة لحسابات إنستغرام مع الإيميل والهاتف المنشورين.")
 
     mode = st.selectbox("مصدر البيانات", list(MODE_LABELS), format_func=MODE_LABELS.get, key="mode")
-    audience = "commenters"
+    audience, search_kind, min_views, caption_only = "commenters", "reels", 0, True
     if mode == "reel":
         target = st.text_input("رابط الريل أو المنشور", placeholder="https://www.instagram.com/reel/…",
                                key="target_reel")
@@ -609,24 +861,45 @@ def main() -> None:
         if audience != "commenters":
             st.caption("ملاحظة: إنستغرام لا يعطي إلا جزءاً محدوداً من قائمة المعجبين، "
                        "أما التعليقات فتُجلب صفحة بعد صفحة حتى العدد المطلوب.")
+    elif mode == "search":
+        search_kind = st.radio("نوع البحث", list(SEARCH_LABELS), format_func=SEARCH_LABELS.get, key="search_kind")
+        is_tag = search_kind != "reels"
+        target = st.text_input("الهاشتاغ" if is_tag else "كلمة البحث",
+                               placeholder="#cantsleep" if is_tag else "i want sleep", key="target_search")
+        min_views = int(st.number_input(
+            "حد أدنى للمشاهدات (للصور: الإعجابات)", min_value=0, value=0, step=10000, key="min_views",
+            help="0 = بدون فلتر. الصفحات الكبيرة تضع غالباً إيميلاً للإعلانات والتعاون."))
+        caption_only = st.checkbox("لا تفحص بروفايل من وُجد إيميله في نص المنشور (توفير)", value=True,
+                                   key="caption_only")
     else:
         target = st.text_input("الحساب المستهدف", placeholder="username أو رابط البروفايل", key="target_user")
     limit = int(st.number_input("عدد الحسابات المطلوب", min_value=1, max_value=20000, value=100,
                                 step=50, key="limit"))
     skip_private = st.checkbox("تخطَّ الحسابات الخاصة (لا إيميلات تجارية فيها عادةً، ويوفّر الطلبات)",
                                value=True, key="skip_private")
+    personal_only = st.checkbox(
+        "الحسابات الشخصية فقط (استبعد التجارية والموثّقة)", value=False, key="personal_only",
+        help="الموثّقون والحسابات التي تظهر تجارية في القائمة تُتخطّى مجاناً، "
+             "والباقي يُستبعد من النتائج بعد الفحص لأن نوع الحساب لا يُعرف إلا من البروفايل.")
 
     estimate = estimate_requests(limit, mode, audience)
     st.caption(f"التكلفة القصوى التقريبية: {estimate:,} طلب ≈ {estimate * price:.2f}$")
 
     if st.button("ابدأ الاستخراج", type="primary", key="start"):
-        target_ok = target.strip() if mode == "reel" else clean_username(target)
+        if mode == "reel":
+            target_ok, missing = target.strip(), "الصق رابط الريل أولاً."
+        elif mode == "search":
+            target_ok, missing = clean_search_term(search_kind, target), "اكتب كلمة البحث أو الهاشتاغ أولاً."
+        else:
+            target_ok, missing = clean_username(target), "اكتب اسم الحساب المستهدف أو الصق رابطه."
         if not api_key.strip():
             st.error("أدخل مفتاح HikerAPI في الشريط الجانبي أولاً.")
         elif not target_ok:
-            st.error("الصق رابط الريل أولاً." if mode == "reel" else "اكتب اسم الحساب المستهدف أو الصق رابطه.")
+            st.error(missing)
         else:
-            run_job(HikerClient(api_key, base_url), target, mode, audience, limit, skip_private, workers)
+            run_job(HikerClient(api_key, base_url), target, mode, limit, skip_private, workers,
+                    audience=audience, search_kind=search_kind, min_views=min_views,
+                    caption_only=caption_only, personal_only=personal_only)
 
     show_results(price)
 
